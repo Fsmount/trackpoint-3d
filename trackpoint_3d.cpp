@@ -1,6 +1,3 @@
-// emulate a 3d mouse using a trackpoint and keyboard
-// feeds synthetic input to spacenavd via uinput
-
 #include <fcntl.h>
 #include <linux/input.h>
 #include <linux/uinput.h>
@@ -13,43 +10,58 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <fstream>
+#include <filesystem>
+#include <sstream>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_set>
 #include <vector>
+#include <sys/stat.h>
+#include <limits.h>
+#include <cerrno>
+#include <sys/wait.h>
 
 namespace {
-constexpr int VENDOR_ID = 0x046D; // id from spacenavd source code
-constexpr int PRODUCT_ID = 0xC603; // id from spacenavd source code
+constexpr int VENDOR_ID = 0x046D;
+constexpr int PRODUCT_ID = 0xC603;
 constexpr int AXIS_MIN = -5000;
 constexpr int AXIS_MAX = 5000;
-constexpr int DEADZONE = 2; // small motion ignored
-constexpr double DEFAULT_GAIN = 60.0; // speed multiplier
-constexpr int DEFAULT_HOTKEY = KEY_F8; // default key to toggle grabbing
+constexpr int DEADZONE = 2;
+constexpr double DEFAULT_GAIN = 60.0;
+constexpr int DEFAULT_HOTKEY = KEY_F8;
+
+constexpr const char* DEFAULT_ENV_DIR = "/etc/trackpoint-3d";
+constexpr const char* DEFAULT_ENV_FILE = "trackpoint-3d.env";
+constexpr const char* DEFAULT_SERVICE_NAME = "trackpoint-3d";
 
 const int ALL_AXES[6] = {ABS_X, ABS_Y, ABS_Z, ABS_RX, ABS_RY, ABS_RZ};
 
-// struct to hold input args
 struct Args {
-    std::string tp_path; // trackpoint event file
-    std::string kbd_path; // keyboard event file
+    std::string tp_path;
+    std::string kbd_path;
     double gain = DEFAULT_GAIN;
     int hotkey = DEFAULT_HOTKEY;
+    bool install = false;
+    std::string install_path = "/usr/local/bin/trackpoint-3d";
+    std::string service_name = DEFAULT_SERVICE_NAME;
+    std::string env_dir = DEFAULT_ENV_DIR;
 };
 
-// print usage and exit
+static bool g_show_install = true;
+
 void usage(const char* prog) {
     std::cerr << "Usage: " << prog
               << " --tp <trackpoint_event> --kbd <keyboard_event> [options]\n\n"
               << "Options:\n"
               << "  --gain <float>         Scale factor for deltas (default 60)\n"
               << "  --hotkey <keycode>     EV_KEY code to toggle grab (default KEY_F8)\n"
+              << (g_show_install ? "\nInstall (run as root):\n  --install              Install binary + systemd service (one-time)\n  --install-path <path>  Install binary path (default /usr/local/bin/trackpoint-3d)\n  --service-name <name>  Systemd unit base name (default trackpoint-3d)\n  --env-dir <dir>        Directory for .env file (default /etc/trackpoint-3d)\n" : "")
               << std::endl;
     std::exit(EXIT_FAILURE);
 }
 
-// parse command line args
 Args parse_args(int argc, char** argv) {
     Args a;
     for (int i = 1; i < argc; ++i) {
@@ -62,17 +74,58 @@ Args parse_args(int argc, char** argv) {
             a.gain = std::stod(argv[++i]);
         } else if (arg == "--hotkey" && i + 1 < argc) {
             a.hotkey = std::stoi(argv[++i]);
+        } else if (arg == "--install") {
+            a.install = true;
+        } else if (arg == "--install-path" && i + 1 < argc) {
+            a.install_path = argv[++i];
+        } else if (arg == "--service-name" && i + 1 < argc) {
+            a.service_name = argv[++i];
+        } else if (arg == "--env-dir" && i + 1 < argc) {
+            a.env_dir = argv[++i];
+        } else if (arg == "--help" || arg == "-h") {
+            usage(argv[0]);
         } else {
             usage(argv[0]);
         }
     }
-    if (a.tp_path.empty() || a.kbd_path.empty()) {
-        usage(argv[0]);
-    }
     return a;
 }
 
-// emit a single input event to uinput
+std::string read_self_path();
+
+static bool run_cmd_ok(const std::string& cmd, const char* action) {
+    int rc = system(cmd.c_str());
+    if (rc == -1) {
+        perror(action);
+        return false;
+    }
+    if (WIFEXITED(rc)) {
+        int code = WEXITSTATUS(rc);
+        if (code == 0) return true;
+        std::cerr << action << " failed with exit code " << code << std::endl;
+        return false;
+    }
+    if (WIFSIGNALED(rc)) {
+        std::cerr << action << " terminated by signal " << WTERMSIG(rc) << std::endl;
+        return false;
+    }
+    std::cerr << action << " failed with status " << rc << std::endl;
+    return false;
+}
+
+static bool is_installed_copy(const std::string& service_name) {
+    namespace fs = std::filesystem;
+    std::string unit_path = "/etc/systemd/system/" + service_name + ".service";
+    if (!fs::exists(unit_path)) return false;
+    std::ifstream in(unit_path);
+    if (!in) return false;
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    std::string content = ss.str();
+    std::string self = read_self_path();
+    return content.find(self) != std::string::npos;
+}
+
 void emit(int fd, uint16_t type, uint16_t code, int32_t value, bool syn = true) {
     input_event ev{};
     ev.type = type;
@@ -92,10 +145,8 @@ void emit(int fd, uint16_t type, uint16_t code, int32_t value, bool syn = true) 
     }
 }
 
-// clamp value to axis bounds
 int clamp(int v) { return std::max(AXIS_MIN, std::min(AXIS_MAX, v)); }
 
-// setup the fake input device
 int setup_uinput() {
     int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
     if (fd < 0) {
@@ -138,7 +189,6 @@ int setup_uinput() {
     return fd;
 }
 
-// reset all axes to 0
 void zero_all_axes(int ufd) {
     for (int i = 0; i < 6; ++i) {
         emit(ufd, EV_ABS, ALL_AXES[i], 0, false);
@@ -146,15 +196,12 @@ void zero_all_axes(int ufd) {
     emit(ufd, EV_SYN, SYN_REPORT, 0, true);
 }
 
-std::atomic<bool> running{true}; // stops threads on exit
+std::atomic<bool> running{true};
 
-// signal handler to stop
 void sigint_handler(int) { running = false; }
 
-// control modes
 enum class Mode { ORBIT, TILT, PAN };
 
-// turn mode enum into name
 std::string mode_name(Mode m) {
     switch (m) {
         case Mode::TILT:
@@ -166,9 +213,103 @@ std::string mode_name(Mode m) {
     }
 }
 
-} // end namespace
+std::string read_self_path() {
+    char buf[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n < 0) {
+        perror("readlink /proc/self/exe");
+        std::exit(EXIT_FAILURE);
+    }
+    buf[n] = '\0';
+    return std::string(buf);
+}
+
+
+}
 
 int main(int argc, char** argv) {
+    namespace fs = std::filesystem;
+    g_show_install = !is_installed_copy(DEFAULT_SERVICE_NAME);
+    Args args = parse_args(argc, argv);
+
+    if (args.install) {
+        if (!g_show_install) {
+            std::cerr << "install option is not available for the installed binary" << std::endl;
+            usage(argv[0]);
+        }
+        if (geteuid() != 0) { std::cerr << "install requires root" << std::endl; return EXIT_FAILURE; }
+        if (args.tp_path.empty() || args.kbd_path.empty()) {
+            std::cerr << "--install requires --tp and --kbd" << std::endl;
+            return EXIT_FAILURE;
+        }
+        if (!fs::exists(args.tp_path)) { std::cerr << "tp path not found: " << args.tp_path << std::endl; return EXIT_FAILURE; }
+        if (!fs::exists(args.kbd_path)) { std::cerr << "kbd path not found: " << args.kbd_path << std::endl; return EXIT_FAILURE; }
+        if (!run_cmd_ok("command -v systemctl >/dev/null 2>&1", "systemctl availability check")) {
+            std::cerr << "systemctl not available; systemd required for --install" << std::endl;
+            return EXIT_FAILURE;
+        }
+        std::string unit_path = "/etc/systemd/system/" + args.service_name + ".service";
+        if (fs::exists(unit_path)) {
+            std::cerr << "already installed: " << unit_path << " exists; refusing to reinstall" << std::endl;
+            std::cerr << "edit the env file and restart the service if you need changes." << std::endl;
+            return EXIT_FAILURE;
+        }
+        std::string self = read_self_path();
+        try {
+            if (self != args.install_path) {
+                fs::create_directories(fs::path(args.install_path).parent_path());
+                fs::copy_file(self, args.install_path, fs::copy_options::overwrite_existing);
+                if (chmod(args.install_path.c_str(), 0755) != 0) { perror("chmod install_path"); return EXIT_FAILURE; }
+            }
+            fs::create_directories(args.env_dir);
+        } catch (const fs::filesystem_error& e) {
+            std::cerr << "filesystem error: " << e.what() << std::endl;
+            return EXIT_FAILURE;
+        }
+        std::string env_path = args.env_dir + std::string("/") + DEFAULT_ENV_FILE;
+        {
+            std::ofstream ef(env_path, std::ios::out | std::ios::trunc);
+            if (!ef) { std::cerr << "failed to write env file: " << env_path << std::endl; return EXIT_FAILURE; }
+            ef << "TP_EVENT=" << args.tp_path << "\n";
+            ef << "KBD_EVENT=" << args.kbd_path << "\n";
+            ef << "GAIN=" << args.gain << "\n";
+            ef << "HOTKEY=" << args.hotkey << "\n";
+            ef.flush();
+            if (!ef) { std::cerr << "failed to flush env file: " << env_path << std::endl; return EXIT_FAILURE; }
+        }
+        if (chmod(env_path.c_str(), 0644) != 0) { perror("chmod env file"); return EXIT_FAILURE; }
+        {
+            fs::create_directories(fs::path(unit_path).parent_path());
+            std::ofstream uf(unit_path, std::ios::out | std::ios::trunc);
+            if (!uf) { std::cerr << "failed to write unit file: " << unit_path << std::endl; return EXIT_FAILURE; }
+            uf << "[Unit]\n";
+            uf << "Description=TrackPoint 3D mouse emulation\n";
+            uf << "After=local-fs.target\n";
+            uf << "ConditionPathExists=/dev/uinput\n\n";
+            uf << "[Service]\n";
+            uf << "Type=simple\n";
+            uf << "EnvironmentFile=" << env_path << "\n";
+            uf << "ExecStart=/bin/sh -c 'exec \"" << args.install_path
+               << "\" --tp \"${TP_EVENT}\" --kbd \"${KBD_EVENT}\" ${GAIN:+--gain \"${GAIN}\"} ${HOTKEY:+--hotkey \"${HOTKEY}\"}'\n";
+            uf << "Restart=on-failure\n";
+            uf << "RestartSec=2s\n\n";
+            uf << "[Install]\n";
+            uf << "WantedBy=multi-user.target\n";
+            uf.flush();
+            if (!uf) { std::cerr << "failed to flush unit file: " << unit_path << std::endl; return EXIT_FAILURE; }
+        }
+        if (!run_cmd_ok("systemctl daemon-reload", "systemctl daemon-reload")) return EXIT_FAILURE;
+        std::string en_cmd = "systemctl enable " + args.service_name + ".service";
+        std::string rs_cmd = "systemctl restart " + args.service_name + ".service";
+        if (!run_cmd_ok(en_cmd, "systemctl enable")) return EXIT_FAILURE;
+        if (!run_cmd_ok(rs_cmd, "systemctl restart")) return EXIT_FAILURE;
+        std::cout << "Service installed and started." << std::endl;
+        return 0;
+    }
+
+    if (args.tp_path.empty() || args.kbd_path.empty()) {
+        usage(argv[0]);
+    }
     if (geteuid() != 0) {
         std::cerr << "run as root" << std::endl;
         return EXIT_FAILURE;
@@ -177,10 +318,8 @@ int main(int argc, char** argv) {
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigint_handler);
 
-    Args args = parse_args(argc, argv);
     int ufd = setup_uinput();
 
-    // open a device for reading
     auto open_evdev = [](const std::string& path) {
         int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
         if (fd < 0) {
@@ -203,7 +342,6 @@ int main(int argc, char** argv) {
     bool grabbed = false;
     Mode last_mode = Mode::ORBIT;
 
-    // thread to track keyboard input and toggle grabbing
     std::thread kbd_thread([&] {
         input_event ev;
         while (running) {
@@ -244,7 +382,6 @@ int main(int argc, char** argv) {
             if (std::abs(dy) < DEADZONE) dy = 0;
             if (dx == 0 && dy == 0) continue;
 
-            // diagonal smoothing
             if (dx && dy) {
                 double scale = std::max(std::abs(dx), std::abs(dy)) /
                                 ((std::abs(dx) + std::abs(dy)) / std::sqrt(2.0));
