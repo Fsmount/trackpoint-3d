@@ -9,6 +9,8 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <cctype>
+#include <algorithm>
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -21,6 +23,8 @@
 #include <sys/stat.h>
 #include <limits.h>
 #include <cerrno>
+#include <sys/inotify.h>
+#include <poll.h>
 #include <sys/wait.h>
 
 namespace {
@@ -38,12 +42,34 @@ constexpr const char* DEFAULT_SERVICE_NAME = "trackpoint-3d";
 
 const int ALL_AXES[6] = {ABS_X, ABS_Y, ABS_Z, ABS_RX, ABS_RY, ABS_RZ};
 
+static bool parse_index_strict(const std::string& s, size_t& out) {
+    if (s.empty()) return false;
+    for (unsigned char c : s) {
+        if (!std::isdigit(c)) return false;
+    }
+    try {
+        size_t pos = 0;
+        unsigned long v = std::stoul(s, &pos);
+        if (pos != s.size()) return false;
+        out = static_cast<size_t>(v);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 struct Args {
     std::string tp_path;
     std::string kbd_path;
     double gain = DEFAULT_GAIN;
     int hotkey = DEFAULT_HOTKEY;
     bool install = false;
+    bool auto_detect = false;
+    std::vector<std::string> tp_matches;
+    std::vector<std::string> kbd_matches;
+    std::string on_missing = "fail";
+    int wait_secs = 0;
+    bool list_devices = false;
     std::string install_path = "/usr/local/bin/trackpoint-3d";
     std::string service_name = DEFAULT_SERVICE_NAME;
     std::string env_dir = DEFAULT_ENV_DIR;
@@ -53,10 +79,16 @@ static bool g_show_install = true;
 
 void usage(const char* prog) {
     std::cerr << "Usage: " << prog
-              << " --tp <trackpoint_event> --kbd <keyboard_event> [options]\n\n"
+              << " [--tp <path>|auto] [--kbd <path>|auto] [options]\n\n"
               << "Options:\n"
               << "  --gain <float>         Scale factor for deltas (default 60)\n"
               << "  --hotkey <keycode>     EV_KEY code to toggle grab (default KEY_F8)\n"
+              << "  --auto                 Autodetect TP and KBD devices\n"
+              << "  --tp-match <substr>    Ordered match for TP (repeatable)\n"
+              << "  --kbd-match <substr>   Ordered match for KBD (repeatable)\n"
+              << "  --on-missing <policy>  fail|fallback|wait|interactive (default fail)\n"
+              << "  --wait-secs <N>        Wait seconds if --on-missing=wait (0=forever)\n"
+              << "  --list-devices         List candidates and exit\n"
               << (g_show_install ? "\nInstall (run as root):\n  --install              Install binary + systemd service (one-time)\n  --install-path <path>  Install binary path (default /usr/local/bin/trackpoint-3d)\n  --service-name <name>  Systemd unit base name (default trackpoint-3d)\n  --env-dir <dir>        Directory for .env file (default /etc/trackpoint-3d)\n" : "")
               << std::endl;
     std::exit(EXIT_FAILURE);
@@ -74,6 +106,18 @@ Args parse_args(int argc, char** argv) {
             a.gain = std::stod(argv[++i]);
         } else if (arg == "--hotkey" && i + 1 < argc) {
             a.hotkey = std::stoi(argv[++i]);
+        } else if (arg == "--auto") {
+            a.auto_detect = true;
+        } else if (arg == "--tp-match" && i + 1 < argc) {
+            a.tp_matches.push_back(argv[++i]);
+        } else if (arg == "--kbd-match" && i + 1 < argc) {
+            a.kbd_matches.push_back(argv[++i]);
+        } else if (arg == "--on-missing" && i + 1 < argc) {
+            a.on_missing = argv[++i];
+        } else if (arg == "--wait-secs" && i + 1 < argc) {
+            a.wait_secs = std::stoi(argv[++i]);
+        } else if (arg == "--list-devices") {
+            a.list_devices = true;
         } else if (arg == "--install") {
             a.install = true;
         } else if (arg == "--install-path" && i + 1 < argc) {
@@ -232,15 +276,229 @@ int main(int argc, char** argv) {
     g_show_install = !is_installed_copy(DEFAULT_SERVICE_NAME);
     Args args = parse_args(argc, argv);
 
+    auto to_lower = [](std::string s){
+        for (auto &c : s) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+        return s;
+    };
+    auto equals_ci = [&](const std::string& a, const std::string& b){ return to_lower(a) == to_lower(b); };
+    args.on_missing = to_lower(args.on_missing);
+
+
+    auto contains_ci = [&](const std::string& hay, const std::string& needle){
+        auto h = to_lower(hay);
+        auto n = to_lower(needle);
+        return h.find(n) != std::string::npos;
+    };
+
+    auto inotify_fd = [&](){
+        int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (fd < 0) return -1;
+        auto add = [&](const char* d){
+            std::error_code ec; if (std::filesystem::exists(d, ec)) {
+                inotify_add_watch(fd, d, IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO);
+            }
+        };
+        add("/dev/input");
+        add("/dev/input/by-id");
+        add("/dev/input/by-path");
+        return fd;
+    };
+    auto wait_change_or_timeout = [&](int fd, int ms){
+        if (fd < 0) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); return false; }
+        pollfd p{}; p.fd = fd; p.events = POLLIN;
+        int rc = poll(&p, 1, ms);
+        if (rc > 0 && (p.revents & POLLIN)) {
+            char buf[4096];
+            while (read(fd, buf, sizeof(buf)) > 0) {}
+            return true;
+        }
+        return false;
+    };
+
+    struct Candidate { std::string path; std::string base; std::string origin; std::string name; bool has_rel_xy; bool has_keys; };
+    auto evdev_caps = [&](const std::string& path, std::string& name_out, bool& relxy_out, bool& keys_out){
+        relxy_out = false; keys_out = false; name_out.clear();
+        int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
+        if (fd < 0) return;
+        libevdev* dev = nullptr;
+        if (libevdev_new_from_fd(fd, &dev) == 0 && dev) {
+            const char* nm = libevdev_get_name(dev);
+            if (nm) name_out = nm;
+            if (libevdev_has_event_type(dev, EV_REL)) {
+                if (libevdev_has_event_code(dev, EV_REL, REL_X) && libevdev_has_event_code(dev, EV_REL, REL_Y)) relxy_out = true;
+            }
+            if (libevdev_has_event_type(dev, EV_KEY)) keys_out = true;
+            libevdev_free(dev);
+        }
+        close(fd);
+    };
+    auto scan_symlinks = [&](const std::string& dir, const std::string& origin){
+        std::vector<Candidate> v;
+        std::error_code ec;
+        if (!fs::exists(dir, ec)) return v;
+        for (auto& de : fs::directory_iterator(dir, ec)) {
+            if (ec) break;
+            if (!de.is_symlink(ec)) continue;
+            auto base = de.path().filename().string();
+            if (base.find("event-") == std::string::npos) continue;
+            Candidate c{de.path().string(), base, origin, std::string(), false, false};
+            std::string nm; bool relxy=false, keys=false;
+            evdev_caps(c.path, nm, relxy, keys);
+            c.name = nm; c.has_rel_xy = relxy; c.has_keys = keys;
+            v.push_back(c);
+        }
+        std::sort(v.begin(), v.end(), [](const Candidate& a, const Candidate& b){ return a.base < b.base; });
+        return v;
+    };
+
+    auto choose_ordered = [&](const std::vector<Candidate>& pool,
+                              bool want_mouse,
+                              const std::vector<std::string>& rules,
+                              std::string& reason){
+        std::vector<const Candidate*> typed;
+        const std::string suffix = want_mouse ? std::string("-event-mouse") : std::string("-event-kbd");
+        for (const auto& c : pool) {
+            if (c.base.size() < suffix.size()) continue;
+            if (c.base.compare(c.base.size()-suffix.size(), suffix.size(), suffix) != 0) continue;
+            if (want_mouse && !c.has_rel_xy) continue;
+            if (!want_mouse && !c.has_keys) continue;
+            typed.push_back(&c);
+        }
+        if (typed.empty()) return std::string{};
+        int rix = 0;
+        for (const auto& r : rules) {
+            ++rix; if (r.empty()) continue;
+            for (const auto* pc : typed) {
+                if (contains_ci(pc->base, r) || (!pc->name.empty() && contains_ci(pc->name, r))) {
+                    reason = std::string("rule ") + std::to_string(rix) + std::string(" ('") + r + std::string("')");
+                    return pc->path;
+                }
+            }
+        }
+        static const std::vector<std::string> tp_kws = {"trackpoint","thinkpad","lenovo","trackpad","touchpad","logitech","mouse"};
+        static const std::vector<std::string> kb_kws = {"keyboard","kbd","thinkpad","lenovo","logitech"};
+        const auto& kws = want_mouse ? tp_kws : kb_kws;
+        for (const auto& kw : kws) {
+            for (const auto* pc : typed) {
+                if (contains_ci(pc->base, kw) || (!pc->name.empty() && contains_ci(pc->name, kw))) {
+                    reason = std::string("keyword '") + kw + std::string("'");
+                    return pc->path;
+                }
+            }
+        }
+        reason = "first capable in order";
+        return typed.front()->path;
+    };
+
+    auto print_candidates = [&](const std::string& label, const std::vector<Candidate>& v){
+        std::cout << "[scan] " << label << ": " << v.size() << " candidates" << std::endl;
+        for (size_t i = 0; i < v.size(); ++i) {
+            const auto& c = v[i];
+            std::cout << "  [" << (i+1) << "] " << c.path << "  name='" << c.name << "'  caps="
+                      << (c.has_rel_xy ? "relXY" : "-") << "," << (c.has_keys ? "keys" : "-")
+                      << std::endl;
+        }
+    };
+
+    auto autodetect = [&](std::string& tp_out, std::string& kbd_out){
+        auto id = scan_symlinks("/dev/input/by-id", "by-id");
+        auto ppath = scan_symlinks("/dev/input/by-path", "by-path");
+        print_candidates("/dev/input/by-id", id);
+        print_candidates("/dev/input/by-path", ppath);
+        if (tp_out.empty() || to_lower(tp_out) == std::string("auto")) {
+            std::string why;
+            std::string guess = choose_ordered(id, true, args.tp_matches, why);
+            if (guess.empty()) guess = choose_ordered(ppath, true, args.tp_matches, why);
+            if (!guess.empty()) {
+                tp_out = guess;
+                std::cout << "[choose] TP: " << tp_out << " via " << (why.empty()?"fallback":why) << std::endl;
+            }
+        }
+        if (kbd_out.empty() || to_lower(kbd_out) == std::string("auto")) {
+            std::string why;
+            std::string guess = choose_ordered(id, false, args.kbd_matches, why);
+            if (guess.empty()) guess = choose_ordered(ppath, false, args.kbd_matches, why);
+            if (!guess.empty()) {
+                kbd_out = guess;
+                std::cout << "[choose] KBD: " << kbd_out << " via " << (why.empty()?"fallback":why) << std::endl;
+            }
+        }
+        return !tp_out.empty() && !kbd_out.empty();
+    };
+
+    if (args.list_devices) {
+        auto id = scan_symlinks("/dev/input/by-id", "by-id");
+        auto ppath = scan_symlinks("/dev/input/by-path", "by-path");
+        print_candidates("/dev/input/by-id", id);
+        print_candidates("/dev/input/by-path", ppath);
+        return 0;
+    }
+
     if (args.install) {
         if (!g_show_install) {
             std::cerr << "install option is not available for the installed binary" << std::endl;
             usage(argv[0]);
         }
         if (geteuid() != 0) { std::cerr << "install requires root" << std::endl; return EXIT_FAILURE; }
-        if (args.tp_path.empty() || args.kbd_path.empty()) {
-            std::cerr << "--install requires --tp and --kbd" << std::endl;
-            return EXIT_FAILURE;
+        if (args.auto_detect || args.tp_path.empty() || args.kbd_path.empty() || equals_ci(args.tp_path, "auto") || equals_ci(args.kbd_path, "auto")) {
+            std::string tp_guess = args.tp_path;
+            std::string kbd_guess = args.kbd_path;
+            bool ok = autodetect(tp_guess, kbd_guess);
+            if (!ok) {
+                if (args.on_missing == "fallback") {
+                    auto id = scan_symlinks("/dev/input/by-id", "by-id");
+                    auto ppath = scan_symlinks("/dev/input/by-path", "by-path");
+                    for (const auto& c : id) if (tp_guess.empty() && c.base.size()>=12 && c.base.compare(c.base.size()-12,12,"-event-mouse")==0 && c.has_rel_xy) { tp_guess = c.path; break; }
+                    for (const auto& c : ppath) if (tp_guess.empty() && c.base.size()>=12 && c.base.compare(c.base.size()-12,12,"-event-mouse")==0 && c.has_rel_xy) { tp_guess = c.path; break; }
+                    for (const auto& c : id) if (kbd_guess.empty() && c.base.size()>=10 && c.base.compare(c.base.size()-10,10,"-event-kbd")==0 && c.has_keys) { kbd_guess = c.path; break; }
+                    for (const auto& c : ppath) if (kbd_guess.empty() && c.base.size()>=10 && c.base.compare(c.base.size()-10,10,"-event-kbd")==0 && c.has_keys) { kbd_guess = c.path; break; }
+                    ok = !tp_guess.empty() && !kbd_guess.empty();
+                    if (ok) std::cout << "[fallback] selected first capable devices" << std::endl;
+                } else if (args.on_missing == "wait") {
+                    int fdw = inotify_fd();
+                    int waited = 0;
+                    while (!ok && (args.wait_secs == 0 || waited < args.wait_secs)) {
+                        wait_change_or_timeout(fdw, 1000);
+                        waited += 1;
+                        ok = autodetect(tp_guess, kbd_guess);
+                    }
+                    if (fdw >= 0) close(fdw);
+                } else if (args.on_missing == "interactive" && isatty(STDIN_FILENO)) {
+                    auto id = scan_symlinks("/dev/input/by-id", "by-id");
+                    auto ppath = scan_symlinks("/dev/input/by-path", "by-path");
+                    print_candidates("/dev/input/by-id", id);
+                    print_candidates("/dev/input/by-path", ppath);
+                    std::cerr << "[interactive] enter TP index (id:N or path:N), or blank to skip: ";
+                    std::string s;
+                    std::getline(std::cin, s);
+                    if (!s.empty()) {
+                        if (s.rfind("id:",0)==0) {
+                            size_t idx = 0;
+                            if (parse_index_strict(s.substr(3), idx) && idx>=1 && idx<=id.size()) tp_guess = id[idx-1].path;
+                        } else if (s.rfind("path:",0)==0) {
+                            size_t idx = 0;
+                            if (parse_index_strict(s.substr(5), idx) && idx>=1 && idx<=ppath.size()) tp_guess = ppath[idx-1].path;
+                        }
+                    }
+                    std::cerr << "[interactive] enter KBD index (id:N or path:N), or blank to skip: ";
+                    std::getline(std::cin, s);
+                    if (!s.empty()) {
+                        if (s.rfind("id:",0)==0) {
+                            size_t idx = 0;
+                            if (parse_index_strict(s.substr(3), idx) && idx>=1 && idx<=id.size()) kbd_guess = id[idx-1].path;
+                        } else if (s.rfind("path:",0)==0) {
+                            size_t idx = 0;
+                            if (parse_index_strict(s.substr(5), idx) && idx>=1 && idx<=ppath.size()) kbd_guess = ppath[idx-1].path;
+                        }
+                    }
+                    ok = !tp_guess.empty() && !kbd_guess.empty();
+                }
+            }
+            if (!ok) { std::cerr << "autodetect failed; please specify --tp and --kbd" << std::endl; return EXIT_FAILURE; }
+            args.tp_path = tp_guess;
+            args.kbd_path = kbd_guess;
+            std::cout << "[install] autodetected TP: " << args.tp_path << "\n";
+            std::cout << "[install] autodetected KBD: " << args.kbd_path << "\n";
         }
         if (!fs::exists(args.tp_path)) { std::cerr << "tp path not found: " << args.tp_path << std::endl; return EXIT_FAILURE; }
         if (!fs::exists(args.kbd_path)) { std::cerr << "kbd path not found: " << args.kbd_path << std::endl; return EXIT_FAILURE; }
@@ -307,9 +565,70 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    if (args.tp_path.empty() || args.kbd_path.empty()) {
-        usage(argv[0]);
+    if (args.auto_detect || args.tp_path.empty() || args.kbd_path.empty() || equals_ci(args.tp_path, "auto") || equals_ci(args.kbd_path, "auto")) {
+        std::string tp_guess = args.tp_path;
+        std::string kbd_guess = args.kbd_path;
+        bool ok = autodetect(tp_guess, kbd_guess);
+        if (!ok) {
+            if (args.on_missing == "fallback") {
+                auto id = scan_symlinks("/dev/input/by-id", "by-id");
+                auto ppath = scan_symlinks("/dev/input/by-path", "by-path");
+                for (const auto& c : id) if (tp_guess.empty() && c.base.size()>=12 && c.base.compare(c.base.size()-12,12,"-event-mouse")==0 && c.has_rel_xy) { tp_guess = c.path; break; }
+                for (const auto& c : ppath) if (tp_guess.empty() && c.base.size()>=12 && c.base.compare(c.base.size()-12,12,"-event-mouse")==0 && c.has_rel_xy) { tp_guess = c.path; break; }
+                for (const auto& c : id) if (kbd_guess.empty() && c.base.size()>=10 && c.base.compare(c.base.size()-10,10,"-event-kbd")==0 && c.has_keys) { kbd_guess = c.path; break; }
+                for (const auto& c : ppath) if (kbd_guess.empty() && c.base.size()>=10 && c.base.compare(c.base.size()-10,10,"-event-kbd")==0 && c.has_keys) { kbd_guess = c.path; break; }
+                ok = !tp_guess.empty() && !kbd_guess.empty();
+                if (ok) std::cout << "[fallback] selected first capable devices" << std::endl;
+            } else if (args.on_missing == "wait") {
+                int fdw = inotify_fd();
+                int waited = 0;
+                while (!ok && (args.wait_secs == 0 || waited < args.wait_secs)) {
+                    wait_change_or_timeout(fdw, 1000);
+                    waited += 1;
+                    ok = autodetect(tp_guess, kbd_guess);
+                }
+                if (fdw >= 0) close(fdw);
+            } else if (args.on_missing == "interactive" && isatty(STDIN_FILENO)) {
+                auto id = scan_symlinks("/dev/input/by-id", "by-id");
+                auto ppath = scan_symlinks("/dev/input/by-path", "by-path");
+                print_candidates("/dev/input/by-id", id);
+                print_candidates("/dev/input/by-path", ppath);
+                std::cerr << "[interactive] enter TP index (id:N or path:N), or blank: ";
+                std::string s;
+                std::getline(std::cin, s);
+                if (!s.empty()) {
+                    if (s.rfind("id:",0)==0) {
+                        size_t idx = 0;
+                        if (parse_index_strict(s.substr(3), idx) && idx>=1 && idx<=id.size()) tp_guess = id[idx-1].path;
+                    } else if (s.rfind("path:",0)==0) {
+                        size_t idx = 0;
+                        if (parse_index_strict(s.substr(5), idx) && idx>=1 && idx<=ppath.size()) tp_guess = ppath[idx-1].path;
+                    }
+                }
+                std::cerr << "[interactive] enter KBD index (id:N or path:N), or blank: ";
+                std::getline(std::cin, s);
+                if (!s.empty()) {
+                    if (s.rfind("id:",0)==0) {
+                        size_t idx = 0;
+                        if (parse_index_strict(s.substr(3), idx) && idx>=1 && idx<=id.size()) kbd_guess = id[idx-1].path;
+                    } else if (s.rfind("path:",0)==0) {
+                        size_t idx = 0;
+                        if (parse_index_strict(s.substr(5), idx) && idx>=1 && idx<=ppath.size()) kbd_guess = ppath[idx-1].path;
+                    }
+                }
+                ok = !tp_guess.empty() && !kbd_guess.empty();
+            }
+        }
+        if (!ok) {
+            std::cerr << "autodetect failed; please pass --tp and --kbd or connect devices." << std::endl;
+            return EXIT_FAILURE;
+        }
+        args.tp_path = tp_guess;
+        args.kbd_path = kbd_guess;
+        std::cout << "[auto] TP:  " << args.tp_path << "\n";
+        std::cout << "[auto] KBD: " << args.kbd_path << "\n";
     }
+    if (args.tp_path.empty() || args.kbd_path.empty()) { usage(argv[0]); }
     if (geteuid() != 0) {
         std::cerr << "run as root" << std::endl;
         return EXIT_FAILURE;

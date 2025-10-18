@@ -32,16 +32,26 @@ Compile: `g++ -std=c++17 -O2 trackpoint_3d.cpp -levdev -o trackpoint-3d -pthread
 
 - As root:
   - `./trackpoint-3d --tp /dev/input/by-id/...-event-mouse --kbd /dev/input/by-id/...-event-kbd [--gain 60] [--hotkey 66]`
+  - or enable auto-detection: `./trackpoint-3d --auto [--tp-match "TrackPoint"] [--kbd-match "ThinkPad"]`
+    - Uses stable symlinks from `/dev/input/by-id` (preferred) or `/dev/input/by-path`.
+    - Ordered matching (case-insensitive): user rules first (`--tp-match/--kbd-match`), then default keywords, then first capable `-event-mouse`/`-event-kbd`.
+    - `--list-devices` prints candidates (name + capabilities) and exits.
 
 #### systemd install
 
 - As root (one‑time only):
   - `./trackpoint-3d --install --tp /dev/input/by-id/...-event-mouse --kbd /dev/input/by-id/...-event-kbd [--gain 60] [--hotkey 66] [--install-path /usr/local/bin/trackpoint-3d] [--env-dir /etc/trackpoint-3d]`
+  - or with auto-detection: `./trackpoint-3d --install --auto [--tp-match "TrackPoint"] [--kbd-match "ThinkPad"]`
+    - Detected stable symlinks are written into the `.env` file.
 
 ### Config Reference (.env)
 
 - `TP_EVENT=/dev/input/path/to/mouse/event`
 - `KBD_EVENT=/dev/input/path/to/kbd/event`
+- `TP_MATCHES=rule1; rule2; ...` (ordered, case-insensitive)
+- `KBD_MATCHES=rule1; rule2; ...` (ordered, case-insensitive)
+- `ON_MISSING=fail|fallback|wait|interactive` (default `fail`)
+- `WAIT_SECS=N` (only if `ON_MISSING=wait`; 0 = forever)
 - `GAIN=int`
 - `HOTKEY=xx` (EV_KEY code; default is `KEY_F8`)
 
@@ -51,3 +61,6 @@ Compile: `g++ -std=c++17 -O2 trackpoint_3d.cpp -levdev -o trackpoint-3d -pthread
 - Permissions: run as root
 - Unit logs: `journalctl -u trackpoint-3d -f`
 - Device paths changed: update `.env` and restart the service
+  - Or re-run with `--auto` to detect again.
+  - Detection order: `/dev/input/by-id` then `/dev/input/by-path`; within each, rules → default keywords → first capable typed device.
+  - If a preferred device is unplugged, default is to fail with a candidate list. Use `--on-missing=fallback` or `--on-missing=wait` if you prefer.
