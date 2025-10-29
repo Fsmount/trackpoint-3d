@@ -283,6 +283,58 @@ int main(int argc, char** argv) {
     auto equals_ci = [&](const std::string& a, const std::string& b){ return to_lower(a) == to_lower(b); };
     args.on_missing = to_lower(args.on_missing);
 
+    enum class MissingPolicy { FAIL, FALLBACK, WAIT, INTERACTIVE };
+    auto parse_policy = [&](const std::string& s){
+        if (s == "fallback") return MissingPolicy::FALLBACK;
+        if (s == "wait") return MissingPolicy::WAIT;
+        if (s == "interactive") return MissingPolicy::INTERACTIVE;
+        return MissingPolicy::FAIL;
+    };
+    const MissingPolicy policy = parse_policy(args.on_missing);
+
+    auto error_and_usage = [&](const std::string& msg){
+        std::cerr << "error: " << msg << std::endl;
+        usage(argv[0]);
+    };
+
+    auto tp_auto_engaged = [&](){ return args.tp_path.empty() || equals_ci(args.tp_path, "auto"); };
+    auto kbd_auto_engaged = [&](){ return args.kbd_path.empty() || equals_ci(args.kbd_path, "auto"); };
+
+    auto argv_has = [&](const char* opt){
+        for (int i = 1; i < argc; ++i) if (std::strcmp(argv[i], opt) == 0) return true; return false;
+    };
+    if (args.list_devices) {
+        const char* conflicts[] = {"--install","--tp","--kbd","--gain","--hotkey","--auto",
+                                   "--tp-match","--kbd-match","--on-missing","--wait-secs",
+                                   "--install-path","--service-name","--env-dir"};
+        for (const char* c : conflicts) if (argv_has(c)) error_and_usage("--list-devices cannot be combined with other flags");
+    }
+    if (!args.install && (argv_has("--install-path") || argv_has("--service-name") || argv_has("--env-dir"))) {
+        error_and_usage("--install-path/--service-name/--env-dir require --install");
+    }
+    if (argv_has("--wait-secs") && policy != MissingPolicy::WAIT) {
+        error_and_usage("--wait-secs is only valid with --on-missing=wait");
+    }
+    if (args.wait_secs < 0) {
+        error_and_usage("--wait-secs must be non-negative (0 = forever)");
+    }
+    bool any_auto = (args.auto_detect || tp_auto_engaged() || kbd_auto_engaged());
+    if ((policy == MissingPolicy::WAIT || policy == MissingPolicy::INTERACTIVE) && !any_auto) {
+        error_and_usage("--on-missing requires auto selection for at least one device");
+    }
+    if (policy == MissingPolicy::INTERACTIVE && any_auto && !isatty(STDIN_FILENO)) {
+        error_and_usage("--on-missing=interactive requires a TTY when auto-selecting devices");
+    }
+    if (args.auto_detect && !tp_auto_engaged() && !kbd_auto_engaged()) {
+        error_and_usage("--auto has no effect when both --tp and --kbd are explicit");
+    }
+    if (!args.tp_matches.empty() && !tp_auto_engaged()) {
+        error_and_usage("--tp-match requires TP auto selection (use --auto or --tp auto)");
+    }
+    if (!args.kbd_matches.empty() && !kbd_auto_engaged()) {
+        error_and_usage("--kbd-match requires KBD auto selection (use --auto or --kbd auto)");
+    }
+
 
     auto contains_ci = [&](const std::string& hay, const std::string& needle){
         auto h = to_lower(hay);
@@ -405,24 +457,57 @@ int main(int argc, char** argv) {
         auto ppath = scan_symlinks("/dev/input/by-path", "by-path");
         print_candidates("/dev/input/by-id", id);
         print_candidates("/dev/input/by-path", ppath);
-        if (tp_out.empty() || to_lower(tp_out) == std::string("auto")) {
-            std::string why;
-            std::string guess = choose_ordered(id, true, args.tp_matches, why);
-            if (guess.empty()) guess = choose_ordered(ppath, true, args.tp_matches, why);
-            if (!guess.empty()) {
-                tp_out = guess;
-                std::cout << "[choose] TP: " << tp_out << " via " << (why.empty()?"fallback":why) << std::endl;
+        auto choose_rules_only = [&](const std::vector<Candidate>& pool, bool want_mouse, const std::vector<std::string>& rules, std::string& reason){
+            std::vector<const Candidate*> typed;
+            const std::string suffix = want_mouse ? std::string("-event-mouse") : std::string("-event-kbd");
+            for (const auto& c : pool) {
+                if (c.base.size() < suffix.size()) continue;
+                if (c.base.compare(c.base.size()-suffix.size(), suffix.size(), suffix) != 0) continue;
+                if (want_mouse && !c.has_rel_xy) continue;
+                if (!want_mouse && !c.has_keys) continue;
+                typed.push_back(&c);
             }
-        }
-        if (kbd_out.empty() || to_lower(kbd_out) == std::string("auto")) {
-            std::string why;
-            std::string guess = choose_ordered(id, false, args.kbd_matches, why);
-            if (guess.empty()) guess = choose_ordered(ppath, false, args.kbd_matches, why);
-            if (!guess.empty()) {
-                kbd_out = guess;
-                std::cout << "[choose] KBD: " << kbd_out << " via " << (why.empty()?"fallback":why) << std::endl;
+            if (typed.empty()) return std::string{};
+            int rix = 0;
+            for (const auto& r : rules) {
+                ++rix; if (r.empty()) continue;
+                for (const auto* pc : typed) {
+                    if (contains_ci(pc->base, r) || (!pc->name.empty() && contains_ci(pc->name, r))) {
+                        reason = std::string("rule ") + std::to_string(rix) + std::string(" ('") + r + std::string("')");
+                        return pc->path;
+                    }
+                }
             }
-        }
+            return std::string{};
+        };
+
+        auto choose_with_fallbacks = [&](const std::vector<Candidate>& pool, bool want_mouse, const std::vector<std::string>& rules, std::string& reason){
+            return choose_ordered(pool, want_mouse, rules, reason);
+        };
+
+        auto fill_one = [&](bool is_tp, std::string& out){
+            if (!(out.empty() || to_lower(out) == std::string("auto"))) return;
+            std::string why;
+            if (policy == MissingPolicy::FALLBACK) {
+                std::string guess = choose_with_fallbacks(id, is_tp, is_tp ? args.tp_matches : args.kbd_matches, why);
+                if (guess.empty()) guess = choose_with_fallbacks(ppath, is_tp, is_tp ? args.tp_matches : args.kbd_matches, why);
+                if (!guess.empty()) {
+                    out = guess;
+                    std::cout << "[choose] " << (is_tp?"TP":"KBD") << ": " << out << " via " << (why.empty()?"fallback":why) << std::endl;
+                }
+                return;
+            }
+            const auto& rules = is_tp ? args.tp_matches : args.kbd_matches;
+            std::string guess = choose_rules_only(id, is_tp, rules, why);
+            if (guess.empty()) guess = choose_rules_only(ppath, is_tp, rules, why);
+            if (!guess.empty()) {
+                out = guess;
+                std::cout << "[choose] " << (is_tp?"TP":"KBD") << ": " << out << " via " << (why.empty()?"rule":why) << std::endl;
+            }
+        };
+
+        fill_one(true, tp_out);
+        fill_one(false, kbd_out);
         return !tp_out.empty() && !kbd_out.empty();
     };
 
