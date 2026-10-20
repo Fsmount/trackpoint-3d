@@ -6,7 +6,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=/nix/var/nix/gcroots/trackpoint-3d/libexec/trackpoint-3d
+ExecStart=/nix/var/nix/gcroots/trackpoint-3d/libexec/trackpoint-3d --config /etc/trackpoint-3d/trackpoint-3d.env
 Restart=on-failure
 RestartPreventExitStatus=78
 RestartSec=2s

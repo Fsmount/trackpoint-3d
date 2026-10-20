@@ -148,11 +148,19 @@ void emit_translated_motion(const VirtualDevice &six_axis_mouse, Frame frame,
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
   constexpr int invalid_configuration = 78;
+  if (argc == 2 && (std::string_view{argv[1]} == "--help" ||
+                    std::string_view{argv[1]} == "-h")) {
+    std::cout << "Usage: trackpoint-3d --config ABSOLUTE_PATH\n";
+    return EXIT_SUCCESS;
+  }
   try {
+    const std::filesystem::path config_path =
+        trackpoint_config::require_config_path(argc, argv);
     using trackpoint_config::SavedSettings;
-    const SavedSettings saved = trackpoint_config::read_saved_settings();
+    const SavedSettings saved =
+        trackpoint_config::read_saved_settings(config_path);
     for (const SavedSettings::Diagnostic &diagnostic : saved.diagnostics) {
       if (diagnostic.kind == SavedSettings::Diagnostic::Kind::unknown_name)
         std::cerr << "Warning: " << diagnostic.message << '\n';
@@ -161,7 +169,7 @@ int main() {
     }
     const trackpoint_config::Settings &settings = saved.settings;
     if (!settings.tp_event || !settings.kbd_event)
-      throw std::invalid_argument(trackpoint_config::file_path.string() +
+      throw std::invalid_argument(config_path.string() +
                                   ": TP_EVENT and KBD_EVENT are required");
     signal(SIGINT, stop);
     signal(SIGTERM, stop);

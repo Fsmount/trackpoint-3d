@@ -142,11 +142,20 @@ static std::string serialize(const Settings &settings) {
   return output.str();
 }
 
-static std::string read_contents() {
-  const int input = open(file_path.c_str(), O_RDONLY | O_CLOEXEC);
+std::filesystem::path require_config_path(int argc, char *argv[]) {
+  if (argc != 3 || std::string_view{argv[1]} != "--config" || !argv[2][0])
+    throw std::invalid_argument("Expected --config ABSOLUTE_PATH");
+  const std::filesystem::path path{argv[2]};
+  if (!path.is_absolute())
+    throw std::invalid_argument("Configuration path must be absolute");
+  return path;
+}
+
+static std::string read_contents(const std::filesystem::path &path) {
+  const int input = open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (input < 0)
     throw std::system_error(errno, std::generic_category(),
-                            "open " + file_path.string());
+                            "open " + path.string());
   std::string contents;
   std::array<char, 4096> buffer;
   for (;;) {
@@ -157,7 +166,7 @@ static std::string read_contents() {
       const int error = errno;
       close(input);
       throw std::system_error(error, std::generic_category(),
-                              "read " + file_path.string());
+                              "read " + path.string());
     }
     if (count == 0)
       break;
@@ -167,8 +176,8 @@ static std::string read_contents() {
   return contents;
 }
 
-SavedSettings read_saved_settings() {
-  const std::string contents = read_contents();
+SavedSettings read_saved_settings(const std::filesystem::path &path) {
+  const std::string contents = read_contents(path);
   SavedSettings saved;
   std::set<std::string_view> assigned;
   std::string_view unread{contents};
@@ -177,8 +186,7 @@ SavedSettings read_saved_settings() {
     const std::string_view line = unread.substr(0, newline);
     unread.remove_prefix(newline == std::string_view::npos ? unread.size()
                                                            : newline + 1);
-    std::string context =
-        file_path.string() + ":" + std::to_string(number) + ": ";
+    std::string context = path.string() + ":" + std::to_string(number) + ": ";
     try {
       std::string_view remainder{line};
       const std::optional<std::string_view> name = parse_name(remainder);
@@ -213,10 +221,10 @@ SavedSettings read_saved_settings() {
   return saved;
 }
 
-void save(const Settings &settings) {
+void save(const std::filesystem::path &path, const Settings &settings) {
   const std::string contents = serialize(settings);
-  std::filesystem::create_directories(file_path.parent_path());
-  std::string temporary = file_path.string() + ".tmp.XXXXXX";
+  std::filesystem::create_directories(path.parent_path());
+  std::string temporary = path.string() + ".tmp.XXXXXX";
   int output = mkstemp(temporary.data());
   if (output < 0)
     throw std::system_error(errno, std::generic_category(),
@@ -244,14 +252,14 @@ void save(const Settings &settings) {
     if (close(descriptor) < 0)
       throw std::system_error(errno, std::generic_category(),
                               "close " + temporary);
-    std::filesystem::rename(temporary, file_path);
+    std::filesystem::rename(temporary, path);
   } catch (...) {
     if (output >= 0)
       close(output);
     unlink(temporary.c_str());
     throw;
   }
-  const std::filesystem::path directory_path = file_path.parent_path();
+  const std::filesystem::path directory_path = path.parent_path();
   const int directory =
       open(directory_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   if (directory < 0)

@@ -9,9 +9,6 @@
 #include <vector>
 
 namespace trackpoint_config {
-inline const std::filesystem::path file_path{
-    "/etc/trackpoint-3d/trackpoint-3d.env"};
-
 struct Setting {
   struct TpEvent {
     std::filesystem::path path;
@@ -51,7 +48,8 @@ struct SavedSettings {
 };
 
 Setting::Gain parse_gain(std::string_view text);
+std::filesystem::path require_config_path(int argc, char *argv[]);
 
-SavedSettings read_saved_settings();
-void save(const Settings &settings);
+SavedSettings read_saved_settings(const std::filesystem::path &path);
+void save(const std::filesystem::path &path, const Settings &settings);
 } // namespace trackpoint_config

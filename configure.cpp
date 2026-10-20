@@ -46,9 +46,8 @@ static std::string ask(const std::string &prompt) {
   return answer;
 }
 
-static void confirm_save() {
-  const std::string answer =
-      ask("\nSave to " + trackpoint_config::file_path.string() + "? [y/N]: ");
+static void confirm_save(const fs::path &path) {
+  const std::string answer = ask("\nSave to " + path.string() + "? [y/N]: ");
   if (answer != "y" && answer != "Y" && answer != "yes")
     throw Cancelled{};
 }
@@ -213,20 +212,20 @@ static Setting::Gain ask_gain(const Setting::Gain &current) {
 int main(int argc, char **argv) {
   if (argc == 2 && (std::string_view(argv[1]) == "--help" ||
                     std::string_view(argv[1]) == "-h")) {
-    std::cout << "Usage: trackpoint-3d-configure\n"
-                 "Interactively configure the trackpoint-3d systemd service.\n"
+    std::cout << "Usage: trackpoint-3d-configure --config ABSOLUTE_PATH\n"
+                 "Interactively configure the TrackPoint-3D daemon.\n"
                  "Requires input-device access and permission to write the "
                  "configuration file.\n"
                  "Run from a terminal. Enter q to cancel.\n";
     return 0;
   }
   try {
-    if (argc != 1)
-      throw std::runtime_error("Usage: trackpoint-3d-configure [--help]");
-    const trackpoint_config::Settings initial_settings = [] {
+    const fs::path config_path =
+        trackpoint_config::require_config_path(argc, argv);
+    const trackpoint_config::Settings initial_settings = [&] {
       try {
         const trackpoint_config::SavedSettings saved =
-            trackpoint_config::read_saved_settings();
+            trackpoint_config::read_saved_settings(config_path);
         for (const trackpoint_config::SavedSettings::Diagnostic &diagnostic :
              saved.diagnostics)
           std::cout << diagnostic.message << '\n';
@@ -266,9 +265,10 @@ int main(int argc, char **argv) {
               << kbd_event.path.string() << ")\n"
               << "Gain: " << gain.value << "\nCapture hotkey: " << hotkey.name()
               << '\n';
-    confirm_save();
-    trackpoint_config::save(settings);
-    std::cout << "Saved. Apply with:\n  systemctl restart trackpoint-3d\n";
+    confirm_save(config_path);
+    trackpoint_config::save(config_path, settings);
+    std::cout << "Saved to " << config_path.string()
+              << ". Start the daemon with the same --config path.\n";
     return 0;
   } catch (const Cancelled &) {
     std::cout << "Configuration cancelled; nothing saved.\n";
